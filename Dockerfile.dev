@@ -1,0 +1,9 @@
+FROM node:gallium-alpine
+
+WORKDIR /app
+
+RUN npm i -g npm@latest
+
+EXPOSE ${APP_PORT}
+
+CMD ["npm", "start"]

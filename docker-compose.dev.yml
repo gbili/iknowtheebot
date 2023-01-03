@@ -1,0 +1,102 @@
+version: '3.7'
+
+services:
+
+  iknowthee-db:
+    image: mariadb:10.9
+    container_name: "${DB_HOST}"
+    environment:
+      MYSQL_ROOT_PASSWORD: "${DB_ROOT_PASSWORD}"
+      MYSQL_DATABASE: "${DB_NAME}"
+      MYSQL_USER: "${DB_USER}"
+      MYSQL_PASSWORD: "${DB_PASSWORD}"
+    volumes:
+      - mysql:/var/lib/mysql
+      - ./mymysql.cnf:/etc/mysql/conf.d/my.cnf
+      - ./mymysql.cnf:/etc/mysql/my.cnf
+    restart: always
+    command: "--default-authentication-plugin=mysql_native_password --character-set-server=${DB_CHARSET} --collation-server=${DB_COLLATION}"
+
+  iknowthee-db_phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: "${DB_HOST}_phpmyadmin"
+    depends_on:
+      - "${DB_HOST}"
+    environment:
+      PMA_HOST: "${DB_HOST}"
+      MYSQL_ROOT_PASSWORD: "${DB_ROOT_PASSWORD}"
+      MYSQL_DATABASE: "${DB_NAME}"
+      MYSQL_USER: "${DB_USER}"
+      MYSQL_PASSWORD: "${DB_PASSWORD}"
+    expose:
+      - 80
+    ports:
+      - target: 80
+        published: "${PMA_PORT}"
+        protocol: tcp
+        mode: host
+    restart: always
+
+  iknowthee-neo4j:
+    container_name: "${APP_DIRNAME}-neo4j"
+    image: neo4j:latest
+    environment:
+      NEO4J_AUTH: "${NEO4J_AUTH}"
+      NEO4JLABS_PLUGINS: "${NEO4JLABS_PLUGINS}"
+      apoc.import.file.enabled: "${NEO4J_APOC_IMPORT}"
+    ports:
+      - target: "${NEO4J_PORT_BOLT}"
+        published: "${NEO4J_PORT_BOLT}"
+        protocol: tcp
+        mode: host
+      - target: "${NEO4J_PORT_BROWSER}"
+        published: "${NEO4J_PORT_BROWSER}"
+        protocol: tcp
+        mode: host
+    volumes:
+      - neo4j:/data
+
+  iknowthee:
+    container_name: "${APP_DIRNAME}"
+    build:
+      dockerfile: ./Dockerfile.dev
+      context: .
+    working_dir: /app
+    environment:
+      APP_DIRNAME: "${APP_DIRNAME}"
+      DB_HOST: "${DB_HOST}"
+      DB_NAME: "${DB_NAME}"
+      DB_USER: "${DB_USER}"
+      DB_PASSWORD: "${DB_PASSWORD}"
+      DB_CHARSET: "${DB_CHARSET}"
+      DB_COLLATION: "${DB_COLLATION}"
+      MULTIPLE_STATEMENTS: "${MULTIPLE_STATEMENTS}"
+      NEO4J_HOST: "${APP_DIRNAME}-neo4j"
+      NEO4J_PORT_BOLT: "${NEO4J_PORT_BOLT}"
+      TELEGRAM_API_TOKEN: "${TELEGRAM_API_TOKEN}"
+      LOGGER_LOG: "${LOGGER_LOG}"
+    command: npm run start
+    ports:
+      - target: "${APP_PORT}"
+        published: "${APP_PORT}"
+        protocol: tcp
+        mode: host
+    volumes:
+      - ./:/app
+    depends_on:
+      - "${DB_HOST}"
+
+
+volumes:
+  mysql:
+    name: "${DB_HOST}-volume"
+    external: true
+  neo4j:
+    name: "${APP_DIRNAME}-neo4j-volume"
+    external: true
+
+
+networks:
+  default:
+    name: nginx-proxy
+    external: true
