@@ -1,5 +1,5 @@
-import { Context, Telegraf } from 'telegraf';
-import { ChatMember, Update, User } from "telegraf/typings/core/types/typegram";
+import { Context, Telegraf, Telegram } from 'telegraf';
+import { ChatMember, ChatMemberAdministrator, ChatMemberOwner, Message, Update, User } from "telegraf/typings/core/types/typegram";
 
 export type TelegramBot = Telegraf<Context<Update>>;
 
@@ -32,6 +32,8 @@ export function isUsernameMention(u: UserCreateProps): u is UsernameMention {
 
 export type UserCreateProps = TelegramUser | UsernameMention;
 
+export type ChatMemberStatus = ChatMember["status"];
+
 export type DBTelegramUser = UUIDProp & {
   id: number;
   is_bot: boolean;
@@ -48,7 +50,9 @@ export type DBUsernameMentionUser = UUIDProp & {
   username: string;
 }
 
+export type StatusProp = { status: ChatMember["status"] };
 export type DBUser = DBTelegramUser | DBUsernameMentionUser;
+export type DBUserWithStatus = DBUser & StatusProp;
 export type UsernameProp = { username: string; }
 export type IdProp = { id: number; }
 export type UsernameMentionnedUser = UsernameProp & Partial<IdProp>;
@@ -76,16 +80,28 @@ export function isByContactName(b: ByContactNameOrUsername): b is ByContactName 
 export type BotServiceUserModel = {
   getUsers: (usersByName?: User[], usersByUsername?: UsernameMentionnedUser[]) => Promise<DBUser[]>;
   getUsersByUUID: (UUIDs: UUID[]) => Promise<DBUser[]>;
-  saveUserGetUUID: (props: { byContactName: User, byUsername?: UsernameMentionnedUser; } | { byContactName?: User, byUsername: UsernameMentionnedUser; }) => Promise<DBUser>;
+  getChatAdministrators(chatId: number, ownerOnly?: boolean): Promise<DBUser[]>;
+  saveGetDBUser(props: ByContactNameOrUsername): Promise<DBUser>;
+  getChatOwner(chatId: number): Promise<DBUser>;
+  saveChatAdministrators(props: (ChatMemberOwner|ChatMemberAdministrator)[], chatId: number, botId: number): Promise<DBUserWithStatus[]>;
+  getChatOwner(chatId: number): Promise<DBUser>;
 }
 
 export type GraphUserModel = {
-  saveUser({ UUID }: { UUID: UUID; }): Promise<number>;
-  saveVouch(voucher: { UUID: UUID }, vouchee: { UUID: UUID }): Promise<void>;
-  getShortestPath(start: { UUID: UUID; }, end: { UUID: UUID; } ): Promise<UUID[]>;
-  getImmediateVouchersUUIDs({ UUID }: { UUID: UUID; }): Promise<UUID[]>;
-  saveUnvouch(voucher: { UUID: string }, vouchee: { UUID: string }): Promise<void>;
+  saveUser({ UUID }: { UUID: UUID; }, chatId: number): Promise<boolean>;
+  saveUsers(users: { UUID: string; }[], chatId: number): Promise<boolean[]>;
+  saveChatVouch(voucher: { UUID: UUID }, vouchee: { UUID: UUID }, chatId: number): Promise<void>;
+  getChatShortestPath(start: { UUID: UUID; }, end: { UUID: UUID; }, chatId: number): Promise<UUID[]>;
+  getChatIntruders({ UUIDs }: { UUIDs: UUID[]; }, chatId: number): Promise<UUID[]>
+  getChatImmediateVouchersUUIDs({ UUID }: { UUID: UUID; }, chatId: number): Promise<UUID[]>;
+  saveChatUnvouch(voucher: { UUID: string }, vouchee: { UUID: string }, chatId: number): Promise<void>;
 }
+
+export type HandlerUpdateParam = {
+  message: Update.New & Update.NonChannel & Message.TextMessage;
+  update_id: number;
+}
+export type CommandHandlerProps = { update: HandlerUpdateParam; telegram: Telegram; }
 
 export type BotServiceModels = {
   UserModel: BotServiceUserModel;

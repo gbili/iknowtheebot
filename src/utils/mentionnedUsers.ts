@@ -1,9 +1,8 @@
 import { isMention, isTextMention } from '../commonTypes';
 import { unmerge } from 'swiss-army-knifey';
 import { Message, MessageEntity, Update, User } from 'telegraf/typings/core/types/typegram';
-import { BotServiceModels, BotServiceUserModel, ContactNameMentionnedUser, DBUser, GetChatMemberProp, isUsernameMention, MentionnedUser, UsernameMentionnedUser, UUID } from '../types';
-import { Telegraf } from 'telegraf/typings/telegraf';
-import { NarrowedContext, Context } from 'telegraf';
+import { BotServiceModels, ContactNameMentionnedUser, DBUser, DBUserWithStatus, GetChatMemberProp, isUsernameMention, MentionnedUser, UsernameMentionnedUser, UUID } from '../types';
+import { NarrowedContext, Context, Telegram } from 'telegraf';
 
 type HasFirstName = { username?: string | null; first_name: string; };
 type HasUsername =  { username: string; first_name?: string | null; };
@@ -38,6 +37,29 @@ export const getMemberById = (telegram: GetChatMemberProp) => async function (ch
   return null;
 }
 
+export const getChatRootNodes = async (
+  {
+    bot,
+    models: { UserModel, graphUserModel },
+    chatId,
+    botId
+  }: {
+    bot: Telegram;
+    models: BotServiceModels;
+    chatId: number;
+    botId: number;
+  },
+  considerAdminsRoot: boolean
+): Promise<DBUserWithStatus[]>  => {
+  const admins = (await bot.getChatAdministrators(chatId));
+  const dbAdmins = await UserModel.saveChatAdministrators(admins, chatId, botId);
+  graphUserModel.saveUsers(dbAdmins, chatId);
+  return considerAdminsRoot
+    ? dbAdmins
+    : dbAdmins.filter(u => u.status === 'creator');
+}
+
+
 export async function getPosterFromName(telegram: GetChatMemberProp, chatId: number, fromId: number) {
   const response = await (getMemberById(telegram)(chatId, fromId));
   // does the response.user.id appear in the "validated users" global message
@@ -45,10 +67,32 @@ export async function getPosterFromName(telegram: GetChatMemberProp, chatId: num
   return fromName;
 }
 
-export const handleVouchPathAndVouchersOf = (models: BotServiceModels, getUUIDsMethod: (watchedMentions: DBUser) => Promise<UUID[]>, getOutcomeMessage: (mentionnedUsers: (User|UsernameMentionnedUser)[], vouchers: DBUser[]) => string) => async (ctx: NarrowedContext<Context<Update>, {
-    message: Update.New & Update.NonChannel & Message.TextMessage;
-    update_id: number;
-  }>) => {
+export const fetchAndSaveAdmins = async (
+  {
+    bot,
+    models,
+    chatId,
+    botId
+  }: {
+    bot: Telegram;
+    models: BotServiceModels;
+    chatId: number;
+    botId: number;
+  },
+  greet: boolean
+) => {
+  const chatAdmins = await getChatRootNodes({ bot, models, chatId, botId }, true);
+  if (greet) await bot.sendMessage(chatId, `Dear admins: ${commaSepExceptForLastOne(chatAdmins.map(userToName))}, I'm now up and running. You can start vouching for people right away. Check the manual with the /help command.`);
+}
+
+
+export const handleVouchPathAndVouchersOf = (
+  models: BotServiceModels,
+  getUUIDsMethod: (watchedMentions: DBUser, chatId: number) => Promise<UUID[]>,
+  getOutcomeMessage: (mentionnedUsers: (User|UsernameMentionnedUser)[], vouchers: DBUser[]) => string
+) => async (
+  ctx: NarrowedContext<Context<Update>, { message: Update.New & Update.NonChannel & Message.TextMessage; update_id: number; }>
+) => {
   console.log(`------------ vouchersOf:ctx`);
   console.log(ctx)
   const { update } = ctx;
@@ -67,7 +111,7 @@ export const handleVouchPathAndVouchersOf = (models: BotServiceModels, getUUIDsM
 
   const vouchersUUIDs = mentionnedUsers.length <= 0 || mentionnedUsers.length > 1
     ? []
-    : await getUUIDsMethod(watchedMentionnedUsers[0]);
+    : await getUUIDsMethod(watchedMentionnedUsers[0], ctx.chat.id);
 
   const byBreadcumbPosition = (a: DBUser, b: DBUser) => vouchersUUIDs.indexOf(a.UUID) - vouchersUUIDs.indexOf(b.UUID);
   const vouchers = (await models.UserModel.getUsersByUUID(vouchersUUIDs)).sort(byBreadcumbPosition);
@@ -89,25 +133,25 @@ export const outcomeMessageGen = (commandName: string, intro: string, outtro: st
     }`
 }
 
-export async function handleVouchUnvouch(bot: Telegraf, models: BotServiceModels, update: UpdateInCommand, command: 'vouch'|'unvouch') {
+export async function handleVouchUnvouch(bot: Telegram, models: BotServiceModels, update: UpdateInCommand, command: 'vouch'|'unvouch') {
   const { message: { from, chat } } = update;
 
   const { byContactName, byUsername } = getMentionnedUsers(update);
   const vouchedUsers = [...byContactName, ...byUsername]
-  const fromName = await getPosterFromName(bot.telegram, chat.id, from.id);
+  const fromName = await getPosterFromName(bot, chat.id, from.id);
 
-  const voucher = await models.UserModel.saveUserGetUUID({ byContactName: from });
-  const voucheesByContactName = await Promise.all(byContactName.map(vouchee => models.UserModel.saveUserGetUUID({ byContactName: vouchee })));
-  const voucheesByUsername = await Promise.all(byUsername.map(vouchee => models.UserModel.saveUserGetUUID({ byUsername: vouchee })));
+  const voucher = await models.UserModel.saveGetDBUser({ byContactName: from });
+  const voucheesByContactName = await Promise.all(byContactName.map(vouchee => models.UserModel.saveGetDBUser({ byContactName: vouchee })));
+  const voucheesByUsername = await Promise.all(byUsername.map(vouchee => models.UserModel.saveGetDBUser({ byUsername: vouchee })));
 
   if (command === 'vouch') {
-    await Promise.all([...voucheesByContactName, ...voucheesByUsername].map(vouchee => models.graphUserModel.saveVouch(voucher, vouchee)));
+    await Promise.all([...voucheesByContactName, ...voucheesByUsername].map(vouchee => models.graphUserModel.saveChatVouch(voucher, vouchee, chat.id)));
   } else {
-    await Promise.all([...voucheesByContactName, ...voucheesByUsername].map(vouchee => models.graphUserModel.saveUnvouch(voucher, vouchee)));
+    await Promise.all([...voucheesByContactName, ...voucheesByUsername].map(vouchee => models.graphUserModel.saveChatUnvouch(voucher, vouchee, chat.id)));
   }
 
-  bot.telegram.sendMessage(chat.id, vouchedUsers.length
-    ? `Thank you ${fromName}, you have ${command}ed for ${vouchedUsers.map(userToName).join(', ')}`
+  bot.sendMessage(chat.id, vouchedUsers.length
+    ? `Thank you ${fromName}, you have ${command}ed ${command === 'vouch' ? 'for ' : ''}${vouchedUsers.map(userToName).join(', ')}`
     : `Hey ${fromName}, I did not understand who you were vouching for.`, {
   });
 
@@ -118,21 +162,17 @@ export type UpdateInCommand = {
   update_id: number;
 }
 
-export const watchMembers = async (UserModel: BotServiceUserModel, members: DBUser[], usersToWatch: MentionnedUser[], overwrite: boolean): Promise<[DBUser[], MentionnedUser[]]> => {
-  const [mentionnedMembers, ] = unmerge(members, dbUser => usersToWatch.filter(isSameUser(dbUser)).length > 0);
-  const [overwrittenMentionnedMembers, newMembers] = unmerge(usersToWatch, aclUser => mentionnedMembers.filter(isSameUser(aclUser)).length > 0);
-  const membersToSave = overwrite
-    ? [...overwrittenMentionnedMembers, ...newMembers]
-    : [...newMembers];
+export const watchMembersBis = async ({ UserModel, graphUserModel }: BotServiceModels, usersToWatch: MentionnedUser[], chatId: number): Promise<DBUser[]> => {
+  const [byUsername, byContactName] = unmerge(usersToWatch, isUsernameMention) as [UsernameMentionnedUser[], User[]];
 
-  const [byUsername, byContactName] = unmerge(membersToSave, isUsernameMention) as [UsernameMentionnedUser[], User[]];
-
-  await Promise.all([
-    ...byUsername.map(member => UserModel.saveUserGetUUID({ byUsername: member })),
-    ...byContactName.map(member => UserModel.saveUserGetUUID({ byContactName: member })),
+  const dbUsers = await Promise.all([
+    ...byUsername.map(member => UserModel.saveGetDBUser({ byUsername: member })),
+    ...byContactName.map(member => UserModel.saveGetDBUser({ byContactName: member })),
   ]);
 
-  return [mentionnedMembers, newMembers];
+  await graphUserModel.saveUsers(dbUsers, chatId);
+
+  return dbUsers;
 }
 
 export default function getMentionnedUsers(update: UpdateInCommand) {
@@ -171,9 +211,6 @@ export default function getMentionnedUsers(update: UpdateInCommand) {
     })
     .filter((s: User | { username: string; }) => s.hasOwnProperty('id') || (s.username && s.username !== ''));
 
-  console.log('byUsername', byUsername);
-  console.log('byContactName', byContactName);
-
   return {
     byContactName,
     byUsername
@@ -197,4 +234,9 @@ export function keepMostInfo(a: DBUser, b: Partial<User>): ReductionForInfoData 
     };
   }, { result: a, unaltered: true, });
   return res;
+}
+
+export function commaSepExceptForLastOne(people: string[]) {
+  const [lastOne, ...rest] = people;
+  return people.length <= 0 ? '' : people.length <= 1 ? lastOne : `${rest.join(', ')} and ${lastOne}`;
 }

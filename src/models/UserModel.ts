@@ -1,9 +1,9 @@
 import { randomUUID } from 'crypto';
 import { RequestorModel } from 'mysql-oh-wait';
 import { isActionResultError } from 'mysql-oh-wait/build/src/ActionResult';
-import { User } from 'telegraf/typings/core/types/typegram';
-import { ByContactNameOrUsername, DBUser, isByContactName, UsernameMentionnedUser, UUID } from '../types';
-import { keepMostInfo } from '../utils/mentionnedUsers';
+import { unmerge } from 'swiss-army-knifey';
+import { ChatMemberAdministrator, ChatMemberOwner, User } from 'telegraf/typings/core/types/typegram';
+import { ByContactNameOrUsername, DBUser, isByContactName, UsernameMentionnedUser, UUID, ChatMemberStatus, DBUserWithStatus } from '../types';
 
 export enum CreateOutcomeCode {
   userExists='USER_EXISTS',
@@ -11,10 +11,6 @@ export enum CreateOutcomeCode {
   usernameNotAvailable='USERNAME_NOT_AVAILABLE',
   userCreated='USER_CREATED',
   forbidden='FORBIDDEN',
-}
-
-function makeUndefinedToNull<T extends { [k: number|string]: number|string|boolean|undefined|null; }>(props: T) {
-  return Object.entries(props).map(([k, v]): [number|string, number|string|boolean|null] => [k, v === undefined ? null : v]).reduce((p, [k, v]) => ({...p, [k]: v, }), {})
 }
 
 function ifNullUndefinedOrValue<T>(a: T) {
@@ -27,6 +23,127 @@ export default class UserModel extends RequestorModel {
 
   static async getUsers(usersByContact?: User[], usersByUsername?: UsernameMentionnedUser[]) {
     return (await (usersByContact || usersByUsername ? UserModel.getDBUsers(usersByContact || [], usersByUsername || []) : UserModel.getDBUsers()));
+  }
+
+  static async getChatAdministrators(chatId: number, ownerOnly: boolean = false): Promise<DBUser[]> {
+    const result = await UserModel.query<DBUser[]>({
+      sql: `
+        SELECT
+          u.\`UUID\`,
+          u.\`id\`,
+          u.\`username\`,
+          u.\`first_name\`,
+          u.\`last_name\`,
+          u.\`is_bot\`
+        FROM
+          User AS u
+          INNER JOIN \`Users_to_Chats\` AS uc
+            ON u.UUID = uc.userUUID AND uc.status ${ownerOnly
+              ? "= 'creator'"
+              : "IN ('creator','administrator')"}
+        WHERE
+          uc.chatId = :chatId
+        ;
+      `,
+      values: { chatId, },
+    });
+
+    if (isActionResultError(result)) {
+      throw result.error;
+    }
+
+    return result.value;
+  }
+
+  static async saveChatAdministrators(props: (ChatMemberOwner|ChatMemberAdministrator)[], chatId: number, botId: number): Promise<DBUserWithStatus[]> {
+    type InserValues = [UUID, number, ChatMemberStatus];
+    type Reduc = { insertValues: InserValues[], selectValues: UUID[], }
+    const values = (await Promise.all(
+      props
+        .filter(({ user }) => user.id !== botId)
+        .map(async ({ user, status }) => ({
+          dbUser: await UserModel.saveGetDBUser({ byContactName: user }),
+          status
+        }))))
+        .reduce((p: Reduc, { dbUser: { UUID }, status }) => ({
+            insertValues: [
+              ...p.insertValues,
+              [UUID, chatId, status] as InserValues,
+            ],
+            selectValues: [...p.selectValues, UUID],
+          }),
+          {
+            insertValues: [],
+            selectValues: [],
+          }
+        );
+
+    const insertSelectActionResult = await UserModel.query<[{}[], DBUserWithStatus[]]>({
+      sql: `
+        INSERT INTO \`Users_to_Chats\` (
+          \`userUUID\`,
+          \`chatId\`,
+          \`status\`
+        ) VALUES :insertValues
+         ON DUPLICATE KEY UPDATE
+          status = VALUES(status)
+        ;
+        SELECT
+          u.\`UUID\`,
+          u.\`id\`,
+          u.\`username\`,
+          u.\`first_name\`,
+          u.\`last_name\`,
+          u.\`is_bot\`,
+          uc.\`status\`
+        FROM
+          User AS u
+          INNER JOIN \`Users_to_Chats\` AS uc
+            ON u.UUID = uc.userUUID
+              AND uc.chatId = :chatId
+              AND uc.status IN ('creator', 'administrator')
+        WHERE
+          UUID IN :selectValues
+        ;
+      `,
+      values: {
+        ...values,
+        chatId,
+      },
+    });
+
+    if (isActionResultError(insertSelectActionResult)) {
+      throw insertSelectActionResult.error;
+    }
+
+    const dbAdmins = insertSelectActionResult.value[1];
+    if (dbAdmins.length === 0) {
+      return [];
+    }
+    const isCurrentListInGroup = (u: { UUID: UUID; }) => -1 !== values.selectValues.findIndex(UUID => UUID === u.UUID)
+    const [currentAdmins, demotedAdmins] = unmerge(dbAdmins, isCurrentListInGroup);
+    if (demotedAdmins.length > 0) {
+      const demoteActionResult = await UserModel.query<[{}[], DBUser[]]>({
+        sql: `
+          UPDATE \`Users_to_Chats\`
+          SET
+            \`status\` = 'member'
+          WHERE
+            \`chatId\` = :chatId
+            AND \`userUUID\` IN :UUIDs
+          ;
+        `,
+        values: {
+          chatId,
+          UUIDs: demotedAdmins.map(da => da.UUID),
+        }
+      });
+      if (isActionResultError(demoteActionResult)) {
+        throw demoteActionResult.error;
+      }
+    }
+
+    return currentAdmins;
   }
 
   static async getUsersByUUID(UUIDs: UUID[]) {
@@ -114,16 +231,6 @@ export default class UserModel extends RequestorModel {
     }
 
     return selectActionResult1.value;
-
-    // const selectActionResult2 = await UserModel.query<DBUser[]>({
-    //   sql: `
-    //     `,
-    //   values: { id: props.id },
-    // });
-    // if (isActionResultError(selectActionResult2)) {
-    //   throw selectActionResult2.error;
-    // }
-    // return selectActionResult2.value;
   }
 
   static async formatToUndefinedOnNull(u: DBUser) {
@@ -137,82 +244,73 @@ export default class UserModel extends RequestorModel {
     };
   }
 
-  static async saveUserGetUUID(props: ByContactNameOrUsername): Promise<DBUser> {
-    try {
-      const isContactName = isByContactName(props);
-      const user = isContactName ? props.byContactName : props.byUsername;
-      const params: [User[], UsernameMentionnedUser[]] = isContactName ? [[props.byContactName] , []] : [[], [props.byUsername]];
-      const matchingUsers = await this.getUsers(...params);
-      if (matchingUsers.length > 0) {
-        const dbUser = matchingUsers[0];
-        const update = keepMostInfo(dbUser, user);
-        const userWithAllAvailableData = update.result;
-        if (update.unaltered === false) {
-          const selectActionResult = await UserModel.query<{}[]>({
-            sql: `UPDATE User
-              SET
-                username=:username,
-                first_name=:first_name,
-                last_name=:last_name,
-                is_bot=:is_bot
-              WHERE
-                UUID=:UUID
-              ;
-              `,
-            values: {
-              ...userWithAllAvailableData,
-            },
-          });
-          if (selectActionResult.error) {
-            throw selectActionResult.error
-          }
-          return { ...userWithAllAvailableData }; // updated username and other props (only when username was not priorly set)
-        }
-        return dbUser; // added nothing
-      }
-
-      const baseDbProps = {
-        id: null,
-        username: null,
-        first_name: null,
-        last_name: null,
-        is_bot: false,
-      }
-      const propsAddInexistentAsNullPlusUUID = {
-        UUID: randomUUID(),
-        ...baseDbProps,
-        ...user,
-      }
-      const allPropsSet = makeUndefinedToNull(propsAddInexistentAsNullPlusUUID) as DBUser;
-      const inserActionResult = await UserModel.query<{}[]>({
-        sql: `INSERT INTO User (
-            UUID,
-            id,
-            username,
-            first_name,
-            last_name,
-            is_bot
-          )
-          VALUES (
-            :UUID,
-            :id,
-            :username,
-            :first_name,
-            :last_name,
-            :is_bot
-          );
-          `,
-        values: allPropsSet,
-      });
-
-      if (isActionResultError(inserActionResult)) {
-        throw inserActionResult.error;
-      }
-
-      return allPropsSet;
-    } catch (err) {
-      throw err;
+  static async saveGetDBUser(props: ByContactNameOrUsername): Promise<DBUser> {
+    const isContactName = isByContactName(props);
+    const user = isContactName ? props.byContactName : props.byUsername;
+    const baseDbProps = {
+      id: null,
+      username: null,
+      first_name: null,
+      last_name: null,
+      is_bot: false,
     }
+    const propsNoUUID = {
+      ...baseDbProps,
+      ...user,
+    }
+    const allProps = {
+      UUID: randomUUID(),
+      ...propsNoUUID,
+    }
+
+    const dbFields = Object.keys(baseDbProps);
+    const nonNullEntries = Object.entries(propsNoUUID).filter(([k, v]) => dbFields.indexOf(k) !== -1 && v !== null);
+    const updateWithValues = nonNullEntries.map(([k, v]) => `\`${k}\` = VALUES(\`${k}\`)`);
+
+    const whereCriteria = nonNullEntries.filter(([k,]) => ['id', 'username'].indexOf(k) !== -1).map(([k, v]) => `${k} = :${k}`);
+    if (whereCriteria.length <= 0) {
+      throw new Error('There should at least be and id or username, weird' + String(propsNoUUID));
+    }
+
+    const insertActionResult = await UserModel.query<[{}[], DBUser[]]>({
+      sql: `
+        INSERT INTO \`User\` (
+          \`UUID\`,
+          \`id\`,
+          \`username\`,
+          \`first_name\`,
+          \`last_name\`,
+          \`is_bot\`
+        ) VALUES (
+          :UUID,
+          :id,
+          :username,
+          :first_name,
+          :last_name,
+          :is_bot
+        ) ON DUPLICATE KEY UPDATE
+          ${updateWithValues.join(`,\n`)}
+        ;
+        SELECT
+          \`UUID\`,
+          \`id\`,
+          \`username\`,
+          \`first_name\`,
+          \`last_name\`,
+          \`is_bot\`
+        FROM
+          User
+        WHERE
+          ${whereCriteria.join(`\nAND `)}
+        ;
+      `,
+      values: allProps,
+    });
+
+    if (isActionResultError(insertActionResult)) {
+      throw insertActionResult.error;
+    }
+    return insertActionResult.value[1][0];
   }
 
 }

@@ -5,96 +5,51 @@ export default class GraphUserModel {
 
   public constructor(private props: { driver: Driver }) {}
 
-  async saveUser({ UUID }: { UUID: string; }): Promise<number> {
+  async saveUser({ UUID }: { UUID: string; }, chatId: number): Promise<boolean> {
     const session = this.props.driver.session();
     try {
-      // Check if the user already exists
       const result = await session.run(
-        'MATCH (user:User {UUID: $UUID}) RETURN user',
+        `MERGE (user:User {UUID: $UUID})
+        MERGE (chat:Chat {chatId: $chatId})
+        MERGE (user)-[:IS_IN]-(chat)
+        RETURN user, chat
+        `,
         {
           UUID,
+          chatId,
         }
       );
-
-      if (result.records.length > 0) {
-        // If the user already exists, do nothing
-        console.log(`User "${UUID}" already exists`);
-        return result.records.length;
-      }
-
-      // If the user does not exist, create a new user node
-      await session.run(
-        'CREATE (user:User {UUID: $UUID}) RETURN user',
-        { UUID }
-      );
-
-      console.log(`User "${UUID}" created`);
-      return 0;
+      return result.records[0].get('user');
     } finally {
       session.close();
     }
   }
 
-  async saveUsers(users: { UUID: string; }[]) {
-    await Promise.all(users.map(u => this.saveUser(u)));
+  async saveUsers(users: { UUID: string; }[], chatId: number) {
+    return await Promise.all(users.map(u => this.saveUser(u, chatId)));
   }
 
-  async saveVouch(voucher: { UUID: string }, vouchee: { UUID: string }) {
+  async getChatIntruders({ UUIDs }: { UUIDs: UUID[]; }, chatId: number) {
     const session = this.props.driver.session();
-    try {
-      // Check if both users exist
-      await this.saveUsers([voucher, vouchee]);
-
-      // Create a friendship relationship between the two users
-      await session.run(
-        'MATCH (voucher:User {UUID: $voucherUUID}), (vouchee:User {UUID: $voucheeUUID}) CREATE (voucher)-[:VOUCHED_FOR]->(vouchee)',
-        {
-          voucherUUID: voucher.UUID,
-          voucheeUUID: vouchee.UUID,
-        }
-      );
-
-      console.log(`Vouch, saved between "${voucher.UUID}" and "${vouchee.UUID}" created`);
-    } finally {
-      session.close();
-    }
-  }
-
-  async saveUnvouch(voucher: { UUID: string }, vouchee: { UUID: string }) {
-    const session = this.props.driver.session();
-    try {
-      // Check if both users exist
-      await this.saveUsers([voucher, vouchee]);
-
-      // Create a friendship relationship between the two users
-      await session.run(
-        `MATCH (voucher:User {UUID: $voucherUUID})-[e:VOUCHED_FOR]->(vouchee:User {UUID: $voucheeUUID})
-        DELETE e;`,
-        {
-          voucherUUID: voucher.UUID,
-          voucheeUUID: vouchee.UUID,
-        }
-      );
-
-      console.log(`Unvouch, removed vouch between "${voucher.UUID}" and "${vouchee.UUID}"`);
-    } finally {
-      session.close();
-    }
-  }
-
-  async getShortestPath(start: { UUID: string; }, end: { UUID: string; } ): Promise<UUID[]> {
-    const session = this.props.driver.session();
-
-    await this.saveUsers([start, end]);
 
     try {
       const result = await session.run(
-        `MATCH (start:User {UUID: $start}), (end:User {UUID: $end}),
-          p = allShortestPaths((start)-[:VOUCHED_FOR*]->(end))
-        RETURN [node in nodes(p) | node.UUID] AS UUIDs;`,
+        `
+        MATCH
+          (user:User)-[:IS_IN]->(chat:Chat {chatId: $chatId}),
+          (vouchingUser:User)-[:IS_IN]->(chat:Chat {chatId: $chatId})
+        WHERE
+          vouchingUser.UUID IN $UUIDs
+          AND NOT user.UUID IN $UUIDs
+          AND NOT (user)<-[:VOUCHED_FOR* {chatId: $chatId}]-(vouchingUser)
+        WITH user.UUID AS UUID, count(user.UUID) AS UUIDCount
+        WHERE UUIDCount >= $totalDisconnectionThreshold
+        RETURN collect(UUID) AS UUIDs
+        `,
         {
-          start: start.UUID,
-          end: end.UUID
+          UUIDs,
+          chatId,
+          totalDisconnectionThreshold: UUIDs.length
         }
       );
       if (result.records.length <= 0) {
@@ -106,13 +61,87 @@ export default class GraphUserModel {
     }
   }
 
-  async getImmediateVouchersUUIDs({ UUID }: { UUID: string; }): Promise<UUID[]> {
+  async saveChatVouch(voucher: { UUID: string }, vouchee: { UUID: string }, chatId: number) {
+    if (voucher.UUID === vouchee.UUID) {
+      return;
+    }
+
     const session = this.props.driver.session();
     try {
-      // Find the user with the given name
+      await this.saveUsers([voucher, vouchee], chatId);
+      await session.run(
+        `MATCH (voucher:User {UUID: $voucherUUID}), (vouchee:User {UUID: $voucheeUUID})
+        CREATE (voucher)-[:VOUCHED_FOR {chatId: $chatId}]->(vouchee)`,
+        {
+          voucherUUID: voucher.UUID,
+          voucheeUUID: vouchee.UUID,
+          chatId,
+        }
+      );
+    } finally {
+      session.close();
+    }
+  }
+
+  async saveChatUnvouch(voucher: { UUID: string }, vouchee: { UUID: string }, chatId: number) {
+    if (voucher.UUID === vouchee.UUID) {
+      return;
+    }
+
+    const session = this.props.driver.session();
+    try {
+      await this.saveUsers([voucher, vouchee], chatId);
+      await session.run(
+        `MATCH (voucher:User {UUID: $voucherUUID})-[e:VOUCHED_FOR {chatId: $chatId}]->(vouchee:User {UUID: $voucheeUUID})
+        DELETE e;`,
+        {
+          voucherUUID: voucher.UUID,
+          voucheeUUID: vouchee.UUID,
+          chatId,
+        }
+      );
+    } finally {
+      session.close();
+    }
+  }
+
+  async getChatShortestPath(start: { UUID: string; }, end: { UUID: string; }, chatId: number): Promise<UUID[]> {
+    await this.saveUsers([start, end], chatId);
+
+    if (start.UUID === end.UUID) {
+      return [start.UUID];
+    }
+
+    const session = this.props.driver.session();
+    try {
       const result = await session.run(
-        'MATCH (vouchee:User {UUID: $UUID})<-[:VOUCHED_FOR]-(voucher:User) RETURN voucher.UUID AS UUID',
-        { UUID }
+        `MATCH (start:User {UUID: $startUUID}), (end:User {UUID: $endUUID}),
+          p = allShortestPaths((start)-[rel:VOUCHED_FOR*]->(end))
+        WHERE ALL(rel in relationships(p) WHERE rel.chatId = $chatId)
+        RETURN [node in nodes(p) | node.UUID] AS UUIDs;
+        `,
+        {
+          startUUID: start.UUID,
+          endUUID: end.UUID,
+          chatId
+        }
+      );
+      if (result.records.length <= 0) {
+        return [];
+      }
+      return result.records[0].get('UUIDs') as UUID[];
+    } finally {
+      session.close();
+    }
+  }
+
+  async getChatImmediateVouchersUUIDs({ UUID }: { UUID: string}, chatId: string): Promise<UUID[]> {
+    const session = this.props.driver.session();
+    try {
+      const result = await session.run(
+        `MATCH (vouchee:User {UUID: $UUID})<-[:VOUCHED_FOR {chatId: $chatId}]-(voucher:User)
+        RETURN voucher.UUID AS UUID`,
+        { UUID, chatId }
       );
       return result.records.map((record) => record.get('UUID'));
     } finally {
